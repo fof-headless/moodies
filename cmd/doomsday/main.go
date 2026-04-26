@@ -64,12 +64,20 @@ func installCmd() *cobra.Command {
 			home, _ := os.UserHomeDir()
 
 			if !st.Components.CACertTrusted {
-				fmt.Println("[install] Generating and installing CA cert...")
-				if err := proxy.GenerateCA(); err != nil {
-					return fmt.Errorf("generate CA: %w", err)
-				}
-				if err := proxy.InstallCA(); err != nil {
-					return fmt.Errorf("install CA: %w", err)
+				alreadyTrusted := func() bool {
+					out, err := exec.Command("security", "find-certificate", "-c", "mitmproxy").Output()
+					return err == nil && len(out) > 0
+				}()
+				if alreadyTrusted {
+					fmt.Println("[install] CA cert already trusted, skipping...")
+				} else {
+					fmt.Println("[install] Generating and installing CA cert...")
+					if err := proxy.GenerateCA(); err != nil {
+						return fmt.Errorf("generate CA: %w", err)
+					}
+					if err := proxy.InstallCA(); err != nil {
+						return fmt.Errorf("install CA: %w", err)
+					}
 				}
 				_ = st.MarkComponent("ca_cert_trusted", true)
 			}
@@ -105,6 +113,15 @@ func installCmd() *cobra.Command {
 				}
 				s.Close()
 				_ = st.MarkComponent("sqlite_initialized", true)
+			}
+
+			// Copy sanitizer.py next to the binary into ~/.doomsday/
+			sanitizerSrc := filepath.Join(filepath.Dir(os.Args[0]), "sanitizer", "sanitizer.py")
+			sanitizerDst := proxy.SanitizerPath()
+			if _, err := os.Stat(sanitizerSrc); err == nil {
+				if data, err := os.ReadFile(sanitizerSrc); err == nil {
+					_ = os.WriteFile(sanitizerDst, data, 0755)
+				}
 			}
 
 			if !st.Components.LaunchdLoaded {
@@ -271,7 +288,7 @@ func doctorCmd() *cobra.Command {
 
 			// 3. PAC active
 			proxyOut, _ := exec.Command("scutil", "--proxy").Output()
-			pacActive := strings.Contains(string(proxyOut), "ProxyAutoConfigEnable: 1")
+			pacActive := strings.Contains(string(proxyOut), "ProxyAutoConfigEnable") && strings.Contains(string(proxyOut), ": 1")
 			checks = append(checks, Check{"PAC active", boolStatus(pacActive), "", false, "doomsday install"})
 
 			// 4. launchd loaded
@@ -429,9 +446,20 @@ func listNetworkServices() []string {
 }
 
 func writeLaunchdPlist(home string) error {
-	daemonPath, _ := exec.LookPath("doomsday-daemon")
-	if daemonPath == "" {
-		daemonPath = filepath.Join(filepath.Dir(os.Args[0]), "doomsday-daemon")
+	// Resolve the absolute path of the doomsday-daemon binary.
+	// os.Args[0] may be relative ("./doomsday"), so we make it absolute first.
+	selfAbs, _ := filepath.Abs(os.Args[0])
+	daemonPath := filepath.Join(filepath.Dir(selfAbs), "doomsday-daemon")
+	if _, err := os.Stat(daemonPath); err != nil {
+		// Fall back to PATH lookup
+		if p, err := exec.LookPath("doomsday-daemon"); err == nil {
+			daemonPath = p
+		}
+	}
+	// Inherit the current PATH so launchd can find mitmdump in /opt/homebrew/bin etc.
+	currentPath := os.Getenv("PATH")
+	if currentPath == "" {
+		currentPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 	}
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -443,6 +471,11 @@ func writeLaunchdPlist(home string) error {
   <array>
     <string>%s</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>%s</string>
+  </dict>
   <key>KeepAlive</key>
   <true/>
   <key>RunAtLoad</key>
@@ -452,7 +485,7 @@ func writeLaunchdPlist(home string) error {
   <key>StandardOutPath</key>
   <string>%s/.doomsday/daemon.log</string>
 </dict>
-</plist>`, daemonPath, home, home)
+</plist>`, daemonPath, currentPath, home, home)
 
 	plistDir := filepath.Join(home, "Library", "LaunchAgents")
 	if err := os.MkdirAll(plistDir, 0755); err != nil { return err }

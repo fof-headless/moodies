@@ -8,11 +8,14 @@ import (
 	"time"
 )
 
-const SanitizerPath = "/usr/local/share/doomsday/sanitizer.py"
-
 type MitmdumpProcess struct {
 	cmd     *exec.Cmd
 	stopped bool
+}
+
+func SanitizerPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".doomsday", "sanitizer.py")
 }
 
 func SpawnMitmdump(port int, storageMode, outputPath string) (*MitmdumpProcess, error) {
@@ -22,15 +25,20 @@ func SpawnMitmdump(port int, storageMode, outputPath string) (*MitmdumpProcess, 
 		return nil, fmt.Errorf("confdir: %w", err)
 	}
 
+	mitmdump, err := resolveMitmdump()
+	if err != nil {
+		return nil, err
+	}
+
 	args := []string{
 		"--listen-port", fmt.Sprint(port),
 		"--set", fmt.Sprintf("confdir=%s", confDir),
 		"--set", "ignore_hosts=^(?!.*(anthropic\\.com|claude\\.ai|claudeusercontent\\.com)).*$",
-		"-s", SanitizerPath,
+		"-s", SanitizerPath(),
 		"--quiet",
 	}
 
-	cmd := exec.Command("mitmdump", args...)
+	cmd := exec.Command(mitmdump, args...)
 	cmd.Env = append(os.Environ(),
 		"STORAGE_MODE="+storageMode,
 		"DOOMSDAY_OUTPUT="+outputPath,
