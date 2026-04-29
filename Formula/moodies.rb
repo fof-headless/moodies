@@ -2,7 +2,7 @@ class Moodies < Formula
   desc "Local proxy agent that captures and sanitizes Claude.ai traffic"
   homepage "https://github.com/fof-headless/moodies"
   url "https://github.com/fof-headless/moodies/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "REPLACE_WITH_SHA256_OF_RELEASE_TARBALL"
+  sha256 "579a0f61f5cea24a09ad90556c2636f01cd4378774e1a628244a4a07d5fef15c"
   license :cannot_represent
   head "https://github.com/fof-headless/moodies.git", branch: "main"
 
