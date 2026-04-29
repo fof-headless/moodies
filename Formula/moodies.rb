@@ -1,10 +1,10 @@
 class Moodies < Formula
   desc "Local proxy agent that captures and sanitizes Claude.ai traffic"
-  homepage "https://github.com/shreyanshkushwaha/homebrew-moodies"
-  url "https://github.com/shreyanshkushwaha/homebrew-moodies/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/shreyanshkushwaha/moodies"
+  url "https://github.com/shreyanshkushwaha/moodies/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "REPLACE_WITH_SHA256_OF_RELEASE_TARBALL"
   license :cannot_represent
-  head "https://github.com/shreyanshkushwaha/homebrew-moodies.git", branch: "main"
+  head "https://github.com/shreyanshkushwaha/moodies.git", branch: "main"
 
   depends_on "go" => :build
   depends_on "python@3.12"

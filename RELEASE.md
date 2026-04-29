@@ -1,16 +1,16 @@
 # Releasing moodies
 
-This repo doubles as the agent source **and** the Homebrew tap. The formula at `Formula/moodies.rb` builds the agent from source on the user's machine.
+This repo is both the agent source and the Homebrew tap. The formula at `Formula/moodies.rb` builds the agent from source on the user's machine.
 
 ## One-time setup
 
 1. Create the repo on github.com (public — brew needs to fetch source):
-   - Name: **`homebrew-moodies`**
+   - Name: **`moodies`**
    - Visibility: **public**
    - Don't init with README/license/.gitignore
 2. Push from the local clone:
    ```
-   git remote add origin https://github.com/shreyanshkushwaha/homebrew-moodies.git
+   git remote add origin https://github.com/shreyanshkushwaha/moodies.git
    git push -u origin main
    ```
 
@@ -22,11 +22,11 @@ This repo doubles as the agent source **and** the Homebrew tap. The formula at `
    git push origin v0.1.0
    ```
    GitHub auto-generates a source tarball at:
-   `https://github.com/shreyanshkushwaha/homebrew-moodies/archive/refs/tags/v0.1.0.tar.gz`
+   `https://github.com/shreyanshkushwaha/moodies/archive/refs/tags/v0.1.0.tar.gz`
 
 2. Compute its sha256:
    ```
-   curl -sL https://github.com/shreyanshkushwaha/homebrew-moodies/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
+   curl -sL https://github.com/shreyanshkushwaha/moodies/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
    ```
 
 3. Update `Formula/moodies.rb`:
@@ -42,7 +42,9 @@ This repo doubles as the agent source **and** the Homebrew tap. The formula at `
 
 ## End user install
 
+The repo isn't named `homebrew-moodies`, so users tap it with an explicit URL:
+
 ```
-brew tap shreyanshkushwaha/moodies
+brew tap shreyanshkushwaha/moodies https://github.com/shreyanshkushwaha/moodies.git
 brew install moodies
 ```
