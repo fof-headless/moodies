@@ -10,7 +10,7 @@ This repo is both the agent source and the Homebrew tap. The formula at `Formula
    - Don't init with README/license/.gitignore
 2. Push from the local clone:
    ```
-   git remote add origin https://github.com/shreyanshkushwaha/moodies.git
+   git remote add origin https://github.com/fof-headless/moodies.git
    git push -u origin main
    ```
 
@@ -22,11 +22,11 @@ This repo is both the agent source and the Homebrew tap. The formula at `Formula
    git push origin v0.1.0
    ```
    GitHub auto-generates a source tarball at:
-   `https://github.com/shreyanshkushwaha/moodies/archive/refs/tags/v0.1.0.tar.gz`
+   `https://github.com/fof-headless/moodies/archive/refs/tags/v0.1.0.tar.gz`
 
 2. Compute its sha256:
    ```
-   curl -sL https://github.com/shreyanshkushwaha/moodies/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
+   curl -sL https://github.com/fof-headless/moodies/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
    ```
 
 3. Update `Formula/moodies.rb`:
@@ -45,6 +45,6 @@ This repo is both the agent source and the Homebrew tap. The formula at `Formula
 The repo isn't named `homebrew-moodies`, so users tap it with an explicit URL:
 
 ```
-brew tap shreyanshkushwaha/moodies https://github.com/shreyanshkushwaha/moodies.git
+brew tap fof-headless/moodies https://github.com/fof-headless/moodies.git
 brew install moodies
 ```
