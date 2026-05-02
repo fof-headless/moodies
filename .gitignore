@@ -1,0 +1,14 @@
+# Built binaries (produced by `go build` in repo root)
+/doomsday
+/doomsday-daemon
+/doomsday-disable
+/dist/
+
+# Claude Code local state
+.claude/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
