@@ -19,23 +19,21 @@ func SanitizerPath() string {
 }
 
 func SpawnMitmdump(port int, storageMode, outputPath string) (*MitmdumpProcess, error) {
-	home, _ := os.UserHomeDir()
-	confDir := filepath.Join(home, ".doomsday", "mitmproxy")
-	if err := os.MkdirAll(confDir, 0700); err != nil {
-		return nil, fmt.Errorf("confdir: %w", err)
-	}
-
 	mitmdump, err := resolveMitmdump()
 	if err != nil {
 		return nil, err
 	}
 
+	// Use mitmproxy's default confdir (~/.mitmproxy). The install step
+	// (cert.go) generates and trusts the CA cert at that location; if we
+	// override confdir here, mitmdump auto-generates a *different* CA at
+	// runtime and TLS handshakes present an untrusted cert that browsers
+	// reject (especially HSTS-preloaded sites).
 	args := []string{
 		"--listen-port", fmt.Sprint(port),
-		"--set", fmt.Sprintf("confdir=%s", confDir),
-		"--set", "ignore_hosts=^(?!.*(anthropic\\.com|claude\\.ai|claudeusercontent\\.com)).*$",
 		"-s", SanitizerPath(),
-		"--quiet",
+		"--set", "termlog_verbosity=warn",
+		"--set", "flow_detail=0",
 	}
 
 	cmd := exec.Command(mitmdump, args...)
