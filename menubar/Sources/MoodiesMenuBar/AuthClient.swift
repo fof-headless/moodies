@@ -24,12 +24,40 @@ enum AuthClient {
         }
     }
 
+    /// Resolves the backend URL in priority order:
+    ///   1. $MOODIES_BACKEND_URL env var (lets you point at a staging
+    ///      backend without editing config files)
+    ///   2. `backend_url = "..."` line in ~/.doomsday/config.toml (the
+    ///      single source of truth the daemon also reads — written by the
+    ///      installer or by `moodies config set`)
+    ///   3. http://localhost:4000 dev default
     static var backendURL: String {
         if let v = ProcessInfo.processInfo.environment["MOODIES_BACKEND_URL"], !v.isEmpty {
             return v
         }
-        // v1 ships dev defaults; matches the daemon's runtime default.
+        if let v = readConfigBackendURL(), !v.isEmpty {
+            return v
+        }
         return "http://localhost:4000"
+    }
+
+    private static func readConfigBackendURL() -> String? {
+        let path = NSHomeDirectory() + "/.doomsday/config.toml"
+        guard let body = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return nil
+        }
+        for raw in body.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("backend_url") else { continue }
+            // Quick TOML-ish parse — string after `=` with surrounding quotes
+            // trimmed. Good enough for the one key we care about.
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let val = line[line.index(after: eq)...]
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            return val
+        }
+        return nil
     }
 
     /// login POSTs to `/api/v1/agent/login` and decodes the response. The

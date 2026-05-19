@@ -4,6 +4,7 @@
 /doomsday-disable
 /moodies-claude
 /dist/
+release/dist/
 
 # Claude Code local state
 .claude/
