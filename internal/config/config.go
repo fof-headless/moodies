@@ -149,16 +149,19 @@ func MergeForFilter(cfg *Config, m *Manifest) (modules ModuleToggles, headers He
 		}
 		return
 	}
+	// Passthrough defaults — see DefaultManifest in manifest.go. The local
+	// Config still supplies target hosts + header rules so a fully offline
+	// daemon (no backend, no cache) still captures Anthropic traffic.
 	modules = ModuleToggles{
-		Redaction:      true,
+		Redaction:      false,
 		Classification: true,
 		Extraction:     true,
-		BodyText:       cfg.StorageMode == "raw",
+		BodyText:       true,
 	}
 	headers = cfg.Filter.Headers
-	redactions = cfg.Redaction.Patterns
+	redactions = nil
 	targetHosts = cfg.Filter.TargetHosts
-	storageMode = cfg.StorageMode
+	storageMode = "raw"
 	return
 }
 

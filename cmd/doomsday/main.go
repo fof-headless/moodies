@@ -133,6 +133,25 @@ func installCmd() *cobra.Command {
 				_ = st.MarkComponent("launchd_loaded", true)
 			}
 
+			// Menu bar auto-launch: drop a second launchd plist that boots
+			// the MoodiesMenuBar.app at every login. The user only ever has
+			// to look at the menu bar to pause/resume/uninstall — no terminal.
+			if !st.Components.MenuBarInstalled {
+				if appPath := findMenuBarApp(); appPath != "" {
+					fmt.Printf("[install] Registering menu bar app: %s\n", appPath)
+					if err := writeMenuBarPlist(home, appPath); err != nil {
+						fmt.Printf("[install]   menubar plist write failed: %v (continuing)\n", err)
+					} else {
+						plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.doomsday.menubar.plist")
+						_ = exec.Command("launchctl", "load", plistPath).Run()
+						_ = exec.Command("open", appPath).Run()
+						_ = st.MarkComponent("menubar_installed", true)
+					}
+				} else {
+					fmt.Println("[install]   menu bar .app not found — build it with `cd menubar && ./build.sh`")
+				}
+			}
+
 			// Claude Code shim — captures the `claude` CLI without breaking
 			// other tools. The shim is a tiny binary that, when invoked,
 			// probes 127.0.0.1:8080, sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS
@@ -194,6 +213,12 @@ func uninstallCmd() *cobra.Command {
 			}
 
 			// Reverse order
+			menubarPlist := filepath.Join(home, "Library", "LaunchAgents", "com.doomsday.menubar.plist")
+			_ = exec.Command("launchctl", "unload", menubarPlist).Run()
+			_ = os.Remove(menubarPlist)
+			_ = exec.Command("pkill", "-f", "MoodiesMenuBar").Run()
+			_ = st.MarkComponent("menubar_installed", false)
+
 			plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.doomsday.agent.plist")
 			_ = exec.Command("launchctl", "unload", plistPath).Run()
 			_ = os.Remove(plistPath)
@@ -540,6 +565,71 @@ func writeLaunchdPlist(home string) error {
 	plistDir := filepath.Join(home, "Library", "LaunchAgents")
 	if err := os.MkdirAll(plistDir, 0755); err != nil { return err }
 	return os.WriteFile(filepath.Join(plistDir, "com.doomsday.agent.plist"), []byte(plist), 0644)
+}
+
+// findMenuBarApp locates a built MoodiesMenuBar.app bundle. Search order:
+//
+//  1. $MOODIES_MENUBAR_APP env override (full path to .app)
+//  2. /Applications/Moodies.app (system-wide install location)
+//  3. ~/Applications/Moodies.app (per-user install, no sudo required)
+//  4. <repo>/menubar/MoodiesMenuBar.app (dev path, relative to the doomsday binary)
+//
+// Returns "" if nothing is found — install logs a hint and continues.
+// The menu bar is optional; the daemon works without it.
+func findMenuBarApp() string {
+	if p := os.Getenv("MOODIES_MENUBAR_APP"); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	home, _ := os.UserHomeDir()
+	selfAbs, _ := filepath.Abs(os.Args[0])
+	repoMenubar := filepath.Join(filepath.Dir(selfAbs), "menubar", "MoodiesMenuBar.app")
+	for _, p := range []string{
+		"/Applications/Moodies.app",
+		filepath.Join(home, "Applications", "Moodies.app"),
+		repoMenubar,
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// writeMenuBarPlist creates ~/Library/LaunchAgents/com.doomsday.menubar.plist
+// pointing at the executable inside the supplied .app bundle. RunAtLoad +
+// KeepAlive=false because the user is allowed to quit the menu bar app —
+// we shouldn't relaunch it every time they do.
+func writeMenuBarPlist(home, appPath string) error {
+	exePath := filepath.Join(appPath, "Contents", "MacOS", "MoodiesMenuBar")
+	if _, err := os.Stat(exePath); err != nil {
+		return fmt.Errorf("menubar executable %s not found inside %s", exePath, appPath)
+	}
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.doomsday.menubar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>`, exePath)
+
+	plistDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(plistDir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(plistDir, "com.doomsday.menubar.plist"), []byte(plist), 0644)
 }
 
 func readHeartbeat(home string) string {

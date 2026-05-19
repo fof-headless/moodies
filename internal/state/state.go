@@ -18,6 +18,9 @@ type ComponentStatus struct {
 	// block into (needed so uninstall can remove the block from exactly the
 	// files we touched, even if the user's shell changed since install).
 	ShellRCFiles []string `json:"shell_rc_files"`
+	// MenuBarInstalled tracks whether ~/Library/LaunchAgents/com.doomsday.menubar.plist
+	// was written + loaded. Uninstall needs to undo both.
+	MenuBarInstalled bool `json:"menubar_installed"`
 }
 
 type State struct {
@@ -79,6 +82,8 @@ func (s *State) MarkComponent(name string, val any) error {
 		s.Components.PACActiveOnServices = val.([]string)
 	case "shell_rc_files":
 		s.Components.ShellRCFiles = val.([]string)
+	case "menubar_installed":
+		s.Components.MenuBarInstalled = val.(bool)
 	case "launchd_loaded":
 		s.Components.LaunchdLoaded = val.(bool)
 	case "sqlite_initialized":

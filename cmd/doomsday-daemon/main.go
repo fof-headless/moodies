@@ -24,6 +24,34 @@ import (
 
 const daemonVersion = "0.1.0"
 
+// Build-time overrides. Populated via:
+//
+//	go build -ldflags "-X main.backendURL=https://api.example.com \
+//	                   -X main.agentToken=prod-secret-token"
+//
+// When non-empty, these win over any value the user has in
+// ~/.doomsday/config.toml — that file becomes a debug-only fallback for
+// development builds. The intent is that release builds ship with the
+// backend hard-wired so end users can't accidentally point the agent at
+// a different sink.
+var (
+	backendURL = ""
+	agentToken = ""
+)
+
+// applyEmbeddedConfig overlays the build-time vars onto cfg, returning the
+// loaded config with overrides applied. Empty overrides leave cfg untouched
+// so `go run` against ~/.doomsday/config.toml keeps working in dev.
+func applyEmbeddedConfig(cfg *config.Config) *config.Config {
+	if backendURL != "" {
+		cfg.BackendURL = backendURL
+	}
+	if agentToken != "" {
+		cfg.AgentToken = agentToken
+	}
+	return cfg
+}
+
 func capabilities() []string {
 	return []string{"redaction", "classification", "extraction", "body_text"}
 }
@@ -92,6 +120,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("[daemon] config: %v", err)
 	}
+	cfg = applyEmbeddedConfig(cfg)
 
 	dbPath := filepath.Join(home, ".doomsday", "buffer.db")
 	st, err := store.OpenInMemory()

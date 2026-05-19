@@ -35,24 +35,32 @@ func ManifestPath() string {
 	return filepath.Join(home, ".doomsday", "manifest.json")
 }
 
-// DefaultManifest is the baseline policy used when both the backend and the
-// on-disk cache are unavailable. Mirrors Defaults() so a never-handshaked
-// daemon still produces useful events.
+// DefaultManifest is the baseline policy when neither the backend nor the
+// on-disk cache is available. v1 ships in passthrough mode: every captured
+// flow is forwarded to the backend with no redaction and full body text.
+// Real per-org filtering (regex redaction, hash-only storage, per-endpoint
+// module toggles) is on the v2 roadmap; the code paths exist in
+// internal/filter/ but the defaults exercise none of them.
 func DefaultManifest() *Manifest {
 	d := Defaults()
 	return &Manifest{
 		Modules: ModuleToggles{
-			Redaction:      true,
-			Classification: true,
-			Extraction:     true,
-			BodyText:       true,
+			Redaction:      false, // passthrough: don't redact anything
+			Classification: true,  // still useful for backend indexing
+			Extraction:     true,  // still useful for backend search
+			BodyText:       true,  // keep full body text
 		},
 		Filter: FilterConfig{
 			TargetHosts: d.Filter.TargetHosts,
-			Headers:     d.Filter.Headers,
+			Headers: HeadersConfig{
+				// Empty allowlist == every header passes through (after
+				// blocklist removal). v1 ships ~zero header redaction.
+				Allowlist: nil,
+				Blocklist: nil,
+			},
 		},
-		Redaction:           RedactionConfig{Patterns: d.Redaction.Patterns},
-		StorageMode:         d.StorageMode,
+		Redaction:           RedactionConfig{Patterns: nil}, // no patterns => no redactions
+		StorageMode:         "raw",
 		RefreshIntervalSecs: 300,
 	}
 }
