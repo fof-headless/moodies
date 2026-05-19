@@ -7,7 +7,7 @@ class Moodies < Formula
   head "https://github.com/fof-headless/moodies.git", branch: "main"
 
   depends_on "go" => :build
-  depends_on "python@3.12"
+  depends_on "mitmproxy"
 
   def install
     ldflags = %W[
@@ -18,15 +18,11 @@ class Moodies < Formula
     system "go", "build", *std_go_args(output: bin/"moodies", ldflags: ldflags), "./cmd/doomsday"
     system "go", "build", *std_go_args(output: bin/"moodies-daemon", ldflags: ldflags), "./cmd/doomsday-daemon"
     system "go", "build", *std_go_args(output: bin/"moodies-disable", ldflags: ldflags), "./cmd/doomsday-disable"
-
-    libexec.install "sanitizer"
+    system "go", "build", *std_go_args(output: bin/"moodies-claude", ldflags: ldflags), "./cmd/moodies-claude"
   end
 
   def caveats
     <<~EOS
-      Sanitizer script bundled at:
-        #{libexec}/sanitizer/sanitizer.py
-
       First-time setup:
         moodies install
 

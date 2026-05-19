@@ -14,6 +14,10 @@ type ComponentStatus struct {
 	PACActiveOnServices []string `json:"pac_active_on_services"`
 	LaunchdLoaded       bool     `json:"launchd_loaded"`
 	SQLiteInitialized   bool     `json:"sqlite_initialized"`
+	// ShellRCFiles is the list of rc files moodies wrote a managed env-var
+	// block into (needed so uninstall can remove the block from exactly the
+	// files we touched, even if the user's shell changed since install).
+	ShellRCFiles []string `json:"shell_rc_files"`
 }
 
 type State struct {
@@ -73,6 +77,8 @@ func (s *State) MarkComponent(name string, val any) error {
 		s.Components.PACFileWritten = val.(bool)
 	case "pac_active_on_services":
 		s.Components.PACActiveOnServices = val.([]string)
+	case "shell_rc_files":
+		s.Components.ShellRCFiles = val.([]string)
 	case "launchd_loaded":
 		s.Components.LaunchdLoaded = val.(bool)
 	case "sqlite_initialized":

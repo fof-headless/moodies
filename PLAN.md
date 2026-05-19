@@ -11,10 +11,11 @@ produced it.
 
 The moodies daemon is mid-refactor. Build is currently broken.
 
-**Chunk 1 (Backend MVP) is DONE** as of 2026-05-06 — see "Status" below.
-**Chunk 2 (daemon refactor)** is the only remaining work: fix the broken
-build, wire `internal/filter/`, add handshake/manifest fetch on the daemon
-side, write `backend.md`.
+**Chunk 1 (Backend MVP) is DONE** as of 2026-05-06.
+**Chunk 2 (daemon refactor) is DONE** as of 2026-05-18 — see "Status".
+**Chunk 3 (one-line installer)** is the only remaining work: ship a
+`curl … | sh` script (uv / Homebrew style) that does brew tap + install +
+`moodies install` in a single command.
 
 ---
 
@@ -68,17 +69,101 @@ Deferred from MVP (intentional, not blockers):
 - No mTLS / signed manifests yet.
 - Backend has no `git init` / GitHub remote yet.
 
-### ⏳ Chunk 2 — daemon refactor — pending
+### ✅ Chunk 2 — daemon refactor — complete (2026-05-18)
 
-This is now the only remaining work. Spec is unchanged from below — fix the
-two `SpawnMitmdump` call sites, add `internal/filter/filter.go` (Apply
-pipeline), wire it into `tailEvents`, delete `sanitizer/`, add
-`internal/config/manifest.go` + handshake/refresh in `internal/sync/client.go`,
-write `backend.md`. See "Chunk 2" section below for line-level detail.
+What landed:
+- `internal/filter/filter.go` — `Apply()` pipeline: header allowlist/blocklist →
+  redaction (body + headers) → classification → per-endpoint extraction →
+  body wrappers (sha256/chars; text omitted in hash_only) → policy summary.
+- `internal/filter/filter_test.go` — 4 smoke tests (public-API completion,
+  hash_only drop, secret redaction, classification-disabled).
+- `internal/config/manifest.go` — `Manifest` type, atomic disk cache at
+  `~/.doomsday/manifest.json`, `DefaultManifest()` fallback.
+- `internal/config/config.go` — `MergeForFilter()` helper deriving filter
+  inputs from `Config + Manifest`.
+- `internal/sync/client.go` — `Handshake`, `RefreshManifest`,
+  `HeartbeatWithRefresh` (drift-detect → refresh → callback). Events POST
+  now includes `session_token` when available.
+- `cmd/doomsday-daemon/main.go` — handshake-with-fallback at startup,
+  `atomic.Pointer[filter.ApplyConfig]` for hot-swap, periodic refresh loop,
+  heartbeat drift refresh, `tailEvents` now decodes RawFlow and runs
+  `filter.Apply`. Both `SpawnMitmdump` call sites use `SpawnOptions`.
+- `backend.md` — daemon ⇄ backend wire contract (auth, all 4 endpoints with
+  curl examples, Manifest + Event JSON schemas, per-endpoint payloads,
+  backwards-compat rules).
+- `Formula/moodies.rb` — dropped `libexec.install "sanitizer"` and
+  `python@3.12` dep; added `mitmproxy` dep.
+- Deleted `sanitizer/sanitizer.py`, `sanitizer/tests/test_sanitizer.py`,
+  `sanitizer/`.
 
-The backend at the sibling repo is ready to receive — once the daemon's
-handshake/manifest plumbing is wired, the dashboard will start showing real
-events.
+`go build ./...` and `go test ./...` both green.
+
+### ⏳ Chunk 3 — one-line installer — pending
+
+Goal: a single command that takes a user from nothing to a running moodies
+daemon, the way `uv` (`curl -LsSf https://astral.sh/uv/install.sh | sh`) or
+Homebrew (`/bin/bash -c "$(curl -fsSL …install.sh)"`) does.
+
+Target UX:
+```
+curl -fsSL https://moodies.fof-headless.dev/install.sh | sh
+```
+(or, until a dedicated domain exists, the raw GitHub URL.)
+
+What the script does, in order:
+1. Sanity-check the platform — `uname -s` must be `Darwin`; bail with a
+   clear message on anything else (Linux/Windows are not supported yet).
+2. Detect or install Homebrew. If `brew` is on `PATH`, reuse it. Otherwise
+   delegate to the official Homebrew installer (same `curl … | bash`
+   one-liner). The daemon itself relies on `mitmproxy` from brew, so brew
+   is non-optional.
+3. `brew tap fof-headless/moodies https://github.com/fof-headless/moodies.git`
+   — the repo isn't named `homebrew-moodies` so the explicit URL form is
+   required (this matches the existing RELEASE.md instructions).
+4. `brew install moodies` — pulls the Go toolchain, builds the three
+   binaries (`moodies`, `moodies-daemon`, `moodies-disable`), installs
+   `mitmproxy` as a runtime dep.
+5. `moodies install` — generates + trusts the mitmproxy CA in the login
+   keychain, writes the PAC file, sets it as the auto-proxy URL on every
+   active network service, initializes SQLite, loads the launchd agent.
+6. `moodies doctor` — final verification; print a summary and exit non-zero
+   if anything is red so the curl-pipe one-liner surfaces failures.
+7. Echo next-step instructions (where to find logs, how to point at a
+   backend, how to uninstall).
+
+Constraints:
+- The script must be re-runnable without breaking an existing install —
+  internally `moodies install` is already resumable via
+  `internal/state.Components.*`. `brew install` is also idempotent
+  (no-op if already installed at the tapped version). So `sh -x install.sh`
+  on a clean machine and on an installed machine should both end at
+  "doctor green" with no destructive prompts in between.
+- The script asks before each privileged step that mutates user state
+  (keychain trust, PAC URL on network services, launchd load) UNLESS run
+  with `-y` / `MOODIES_ASSUME_YES=1`. Default to interactive; opt in to
+  unattended.
+- No `sudo` — everything moodies needs runs in user space (login keychain,
+  user-level networksetup, `~/Library/LaunchAgents`). The Homebrew
+  installer may prompt for sudo; that's out of our hands.
+- Bash 3.2 compatible (default macOS shell). No bashisms that need 4+.
+- Pin to a release tag, not `main`. The script reads
+  `${MOODIES_VERSION:-latest}` and resolves "latest" via the GitHub releases
+  API — never silently installs an untagged commit.
+
+Files to add:
+- `install.sh` at repo root — the script itself, served raw from GitHub.
+- `RELEASE.md` — add a section pointing future installers to bump the
+  pinned default version and recompute checksums in the formula.
+- `README.md` (or `CLAUDE.md`) — add the one-liner at the top so users
+  see it first.
+
+Out of scope for Chunk 3:
+- A dedicated install host / vanity domain. Use the raw GitHub URL until
+  that exists.
+- Linux / WSL support. The daemon is macOS-only by construction
+  (`networksetup`, `security`, launchd, login keychain).
+- A signed binary release. Brew building from source is fine for v1; a
+  notarised pkg is a future hardening pass.
 
 ---
 

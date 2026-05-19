@@ -2,6 +2,7 @@
 /doomsday
 /doomsday-daemon
 /doomsday-disable
+/moodies-claude
 /dist/
 
 # Claude Code local state

@@ -13,6 +13,7 @@ import (
 	"github.com/doomsday/agent/internal/config"
 	"github.com/doomsday/agent/internal/foreign"
 	"github.com/doomsday/agent/internal/proxy"
+	"github.com/doomsday/agent/internal/shellrc"
 	"github.com/doomsday/agent/internal/state"
 	"github.com/doomsday/agent/internal/store"
 	"github.com/spf13/cobra"
@@ -115,14 +116,10 @@ func installCmd() *cobra.Command {
 				_ = st.MarkComponent("sqlite_initialized", true)
 			}
 
-			// Copy sanitizer.py next to the binary into ~/.doomsday/
-			sanitizerSrc := filepath.Join(filepath.Dir(os.Args[0]), "sanitizer", "sanitizer.py")
-			sanitizerDst := proxy.SanitizerPath()
-			if _, err := os.Stat(sanitizerSrc); err == nil {
-				if data, err := os.ReadFile(sanitizerSrc); err == nil {
-					_ = os.WriteFile(sanitizerDst, data, 0755)
-				}
-			}
+			// Note: the mitmproxy addon (formerly sanitizer.py) is now
+			// embedded into the daemon binary and written to ~/.doomsday/_tap.py
+			// at every spawn (see internal/proxy/mitmdump.go writeAddon).
+			// No separate file copy needed at install time.
 
 			if !st.Components.LaunchdLoaded {
 				fmt.Println("[install] Installing launchd service...")
@@ -134,6 +131,39 @@ func installCmd() *cobra.Command {
 					return fmt.Errorf("launchctl load: %w", err)
 				}
 				_ = st.MarkComponent("launchd_loaded", true)
+			}
+
+			// Claude Code shim — captures the `claude` CLI without breaking
+			// other tools. The shim is a tiny binary that, when invoked,
+			// probes 127.0.0.1:8080, sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+			// scoped to that one process, and exec's the real `claude`.
+			// Falls back to direct exec if the proxy is down. We never
+			// touch a system-wide HTTPS_PROXY — the user's Python/Go/Node
+			// apps stay untouched and keep working when the daemon dies.
+			if len(st.Components.ShellRCFiles) == 0 || !shimInstalled(home) {
+				fmt.Println("[install] Installing claude shim...")
+				if err := installClaudeShim(home); err != nil {
+					return fmt.Errorf("install shim: %w", err)
+				}
+				binDir := filepath.Join(home, ".moodies", "bin")
+				targets := shellrc.DetectTargets()
+				var modified []string
+				for _, t := range targets {
+					lines := shellrc.PathPrependLines(t.Shell, binDir)
+					changed, err := shellrc.InstallBlock(t, lines)
+					if err != nil {
+						fmt.Printf("[install]   skip %s: %v\n", t.Path, err)
+						continue
+					}
+					if changed {
+						fmt.Printf("[install]   added PATH prepend to %s\n", t.Path)
+					}
+					modified = append(modified, t.Path)
+				}
+				if len(modified) > 0 {
+					_ = st.MarkComponent("shell_rc_files", modified)
+					fmt.Println("[install] NOTE: open a new terminal for the `claude` shim to take effect.")
+				}
 			}
 
 			now2 := time.Now()
@@ -179,6 +209,16 @@ func uninstallCmd() *cobra.Command {
 
 			_ = proxy.UninstallCA()
 			_ = st.MarkComponent("ca_cert_trusted", false)
+
+			for _, rcPath := range st.Components.ShellRCFiles {
+				if _, err := shellrc.Uninstall(shellrc.RCTarget{Path: rcPath}); err != nil {
+					fmt.Printf("[uninstall]   skip %s: %v\n", rcPath, err)
+				}
+			}
+			_ = st.MarkComponent("shell_rc_files", []string{})
+			_ = os.Remove(filepath.Join(home, ".moodies", "bin", "claude"))
+			_ = os.Remove(filepath.Join(home, ".moodies", "bin"))
+			_ = os.Remove(filepath.Join(home, ".moodies"))
 
 			_ = st.MarkComponent("sqlite_initialized", false)
 
@@ -322,7 +362,17 @@ func doctorCmd() *cobra.Command {
 				checks = append(checks, Check{"Phantom proxy", "fail", "PAC active but port 8080 not listening — proxy traffic will fail", true, "doomsday doctor --fix"})
 			}
 
-			// 9. Foreign proxy detection
+			// 9. Claude shim installed + PATH wired.
+			shimPath := filepath.Join(home, ".moodies", "bin", "claude")
+			_, shimErr := os.Stat(shimPath)
+			shimOk := shimErr == nil
+			shimDetail := shimPath
+			if !shimOk {
+				shimDetail = "missing — `claude` CLI traffic won't be captured"
+			}
+			checks = append(checks, Check{"Claude shim", boolStatus(shimOk), shimDetail, false, "doomsday install"})
+
+			// 10. Foreign proxy detection
 			foreignHits := foreign.Scan()
 			for _, fp := range foreignHits {
 				if fp.PointsToUs {
@@ -504,6 +554,63 @@ func readHeartbeatTime(home string) *time.Time {
 	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
 	if err != nil { return nil }
 	return &t
+}
+
+// shimInstalled reports whether the claude shim binary is present at the
+// expected install path. Used to make the install step re-runnable — if
+// state.json says we installed but the binary is missing (user nuked
+// ~/.moodies), we redo just the shim copy.
+func shimInstalled(home string) bool {
+	_, err := os.Stat(filepath.Join(home, ".moodies", "bin", "claude"))
+	return err == nil
+}
+
+// installClaudeShim copies the `moodies-claude` binary (built alongside the
+// CLI) to ~/.moodies/bin/claude so PATH lookup resolves to the shim first.
+// Resolves the source by checking the same directory as the running
+// doomsday binary, then $PATH — works for both `go build` dev mode and
+// Homebrew's libexec layout.
+func installClaudeShim(home string) error {
+	src, err := findShimSource()
+	if err != nil {
+		return err
+	}
+	dstDir := filepath.Join(home, ".moodies", "bin")
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return err
+	}
+	dst := filepath.Join(dstDir, "claude")
+	in, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("read shim %s: %w", src, err)
+	}
+	// Atomic write so a partial copy doesn't leave a broken binary in PATH.
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, in, 0755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	fmt.Printf("[install]   shim installed at %s -> %s\n", dst, src)
+	return nil
+}
+
+func findShimSource() (string, error) {
+	selfAbs, _ := filepath.Abs(os.Args[0])
+	selfDir := filepath.Dir(selfAbs)
+	for _, name := range []string{"moodies-claude", "moodies-claude-shim"} {
+		cand := filepath.Join(selfDir, name)
+		if _, err := os.Stat(cand); err == nil {
+			return cand, nil
+		}
+	}
+	for _, name := range []string{"moodies-claude", "moodies-claude-shim"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("moodies-claude binary not found next to %s or on PATH", selfAbs)
 }
 
 func filterUs(hits []foreign.ForeignProxy, onlyUs bool) []foreign.ForeignProxy {
