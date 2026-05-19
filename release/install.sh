@@ -59,12 +59,31 @@ green "✓ Homebrew + mitmproxy ready"
 
 # 3. Backend URL ------------------------------------------------------
 echo
-bold "Which backend should the daemon ship events to?"
-DEFAULT_URL="${MOODIES_BACKEND_URL:-http://localhost:4000}"
-echo "  (press Enter to use: $DEFAULT_URL)"
-printf "Backend URL: "
-read -r BACKEND_URL
-BACKEND_URL="${BACKEND_URL:-$DEFAULT_URL}"
+if [[ -n "${MOODIES_BACKEND_URL:-}" ]]; then
+    # The curl-pipe-sh wrapper (oneliner.sh) sets this so the install is
+    # non-interactive when invoked via `curl ... | sh`. The user can still
+    # override by exporting MOODIES_BACKEND_URL manually before running.
+    BACKEND_URL="$MOODIES_BACKEND_URL"
+    bold "Backend URL: $BACKEND_URL (from MOODIES_BACKEND_URL)"
+else
+    bold "Which backend should the daemon ship events to?"
+    DEFAULT_URL="http://localhost:4000"
+    echo "  (press Enter to use: $DEFAULT_URL)"
+    printf "Backend URL: "
+    # Read from the controlling terminal even when stdin is a pipe — lets
+    # this prompt work under `curl ... | sh` as a fallback if the wrapper
+    # didn't pre-fill MOODIES_BACKEND_URL.
+    if [[ -t 0 ]]; then
+        read -r BACKEND_URL
+    elif [[ -r /dev/tty ]]; then
+        read -r BACKEND_URL < /dev/tty
+    else
+        echo
+        red "Can't read interactively — set MOODIES_BACKEND_URL before piping into sh."
+        exit 1
+    fi
+    BACKEND_URL="${BACKEND_URL:-$DEFAULT_URL}"
+fi
 
 # Strip trailing slash so URL concatenation in the daemon doesn't double up.
 BACKEND_URL="${BACKEND_URL%/}"

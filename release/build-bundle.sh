@@ -72,16 +72,30 @@ SHA=$(shasum -a 256 "$DIST_DIR/${BUNDLE_NAME}.tar.gz" | awk '{print $1}')
 # Optional cleanup of the staging tree (keep the tarball).
 rm -rf "$STAGE"
 
+# Versioned tarball is what's checked into a release; the static-named
+# copy is what oneliner.sh expects to find at /moodies.tar.gz on the
+# hosting server. Both files are bit-identical, just symlinked here.
+cp "$DIST_DIR/${BUNDLE_NAME}.tar.gz" "$DIST_DIR/moodies.tar.gz"
+
+# Stage the one-liner wrapper next to the tarball so the operator can
+# `scp` the whole release/dist/ folder up to their server and immediately
+# share `https://host/install`.
+cp release/oneliner.sh "$DIST_DIR/install"
+chmod +x "$DIST_DIR/install"
+
 echo
 bold "Built: $DIST_DIR/${BUNDLE_NAME}.tar.gz ($SIZE)"
 echo "  sha256: $SHA"
 echo
-echo "To share, send the recipient:"
-echo "  1. the tarball above"
-echo "  2. your backend URL (they'll be prompted for it)"
+echo "release/dist/ contains:"
+echo "  ${BUNDLE_NAME}.tar.gz   versioned bundle (archive this)"
+echo "  moodies.tar.gz          stable filename — host this at /moodies.tar.gz"
+echo "  install                 host this at /install"
 echo
-echo "On their machine:"
-echo "  curl -L -o moodies.tar.gz <wherever-you-host-it>"
-echo "  tar -xzf moodies.tar.gz"
-echo "  cd $BUNDLE_NAME"
-echo "  ./install.sh"
+bold "Recipient one-liner (after you host both files at your base URL):"
+echo "  curl -fsSL https://<your-host>/install | sh"
+echo
+echo "Examples of where to host:"
+echo "  • behind your existing ngrok: serve release/dist/ via any static server"
+echo "  • Caddy:   file_server browse"
+echo "  • Python:  python3 -m http.server --directory release/dist 8080"
