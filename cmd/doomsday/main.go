@@ -143,8 +143,10 @@ func installCmd() *cobra.Command {
 						fmt.Printf("[install]   menubar plist write failed: %v (continuing)\n", err)
 					} else {
 						plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.doomsday.menubar.plist")
+						// `launchctl load` triggers RunAtLoad=true which spawns the
+						// app. A second `open <appPath>` here used to launch a
+						// duplicate instance — dropped.
 						_ = exec.Command("launchctl", "load", plistPath).Run()
-						_ = exec.Command("open", appPath).Run()
 						_ = st.MarkComponent("menubar_installed", true)
 					}
 				} else {
