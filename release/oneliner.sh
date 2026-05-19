@@ -22,7 +22,7 @@ set -eu
 
 # Default base URL — the dev ngrok tunnel. Override via env or by editing
 # this single line before hosting on a different domain.
-DEFAULT_BASE_URL="https://421d-106-51-76-189.ngrok-free.app"
+DEFAULT_BASE_URL="https://7983-106-51-76-189.ngrok-free.app"
 
 BASE_URL="${MOODIES_BASE_URL:-$DEFAULT_BASE_URL}"
 BACKEND_URL="${MOODIES_BACKEND_URL:-$BASE_URL}"
