@@ -21,6 +21,11 @@ type ComponentStatus struct {
 	// MenuBarInstalled tracks whether ~/Library/LaunchAgents/com.doomsday.menubar.plist
 	// was written + loaded. Uninstall needs to undo both.
 	MenuBarInstalled bool `json:"menubar_installed"`
+	// ClaudeShimApplied tracks whether we injected HTTPS_PROXY +
+	// NODE_EXTRA_CA_CERTS into Claude.app's LSEnvironment. Uninstall
+	// removes the entries; the daemon watchdog re-applies after Claude
+	// auto-updates wipe them.
+	ClaudeShimApplied bool `json:"claude_shim_applied"`
 }
 
 type State struct {
@@ -84,6 +89,8 @@ func (s *State) MarkComponent(name string, val any) error {
 		s.Components.ShellRCFiles = val.([]string)
 	case "menubar_installed":
 		s.Components.MenuBarInstalled = val.(bool)
+	case "claude_shim_applied":
+		s.Components.ClaudeShimApplied = val.(bool)
 	case "launchd_loaded":
 		s.Components.LaunchdLoaded = val.(bool)
 	case "sqlite_initialized":

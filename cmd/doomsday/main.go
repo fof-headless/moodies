@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/doomsday/agent/internal/claudeshim"
 	"github.com/doomsday/agent/internal/config"
 	"github.com/doomsday/agent/internal/foreign"
 	"github.com/doomsday/agent/internal/proxy"
@@ -133,6 +135,38 @@ func installCmd() *cobra.Command {
 				_ = st.MarkComponent("launchd_loaded", true)
 			}
 
+			// Claude.app capture: inject HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+			// into Claude.app's LSEnvironment dict so every Dock-click
+			// launches the Electron app with our proxy env baked in. The
+			// alternative (system-wide launchctl setenv) has too broad a
+			// blast radius; the LSEnvironment edit is surgical. The daemon
+			// watchdog re-applies after Squirrel auto-updates wipe the
+			// keys, so users never have to think about it.
+			if !st.Components.ClaudeShimApplied {
+				cfg, _ := config.Load()
+				shimCfg := claudeshim.Config{
+					ProxyURL: fmt.Sprintf("http://127.0.0.1:%d", cfg.ListenPort),
+					CAPath:   filepath.Join(home, ".mitmproxy", "mitmproxy-ca-cert.pem"),
+				}
+				if !claudeshim.AppInstalled(shimCfg) {
+					fmt.Println("[install]   Claude.app not found at /Applications — skipping Claude shim")
+				} else {
+					fmt.Println("[install] Injecting proxy env into Claude.app's Info.plist...")
+					switch _, err := claudeshim.Apply(shimCfg); {
+					case err == nil:
+						fmt.Println("[install]   Claude.app now captures by default on every launch")
+						_ = st.MarkComponent("claude_shim_applied", true)
+					case errors.Is(err, claudeshim.ErrSIPProtected):
+						fmt.Println("[install]   Claude.app is SIP-protected by macOS — desktop-app capture")
+						fmt.Println("[install]   isn't possible without disabling System Integrity Protection.")
+						fmt.Println("[install]   Browser + claude CLI capture still works. To capture the")
+						fmt.Println("[install]   desktop app, see README for the LaunchAgent option.")
+					default:
+						fmt.Printf("[install]   claude shim apply failed: %v (continuing)\n", err)
+					}
+				}
+			}
+
 			// Menu bar auto-launch: drop a second launchd plist that boots
 			// the MoodiesMenuBar.app at every login. The user only ever has
 			// to look at the menu bar to pause/resume/uninstall — no terminal.
@@ -243,6 +277,15 @@ func uninstallCmd() *cobra.Command {
 				}
 			}
 			_ = st.MarkComponent("shell_rc_files", []string{})
+
+			// Strip the proxy env from Claude.app's Info.plist if we
+			// added it. Best-effort: a missing app is fine.
+			if st.Components.ClaudeShimApplied {
+				if err := claudeshim.Remove(claudeshim.Config{}); err != nil {
+					fmt.Printf("[uninstall]   claude shim remove: %v\n", err)
+				}
+				_ = st.MarkComponent("claude_shim_applied", false)
+			}
 			_ = os.Remove(filepath.Join(home, ".moodies", "bin", "claude"))
 			_ = os.Remove(filepath.Join(home, ".moodies", "bin"))
 			_ = os.Remove(filepath.Join(home, ".moodies"))

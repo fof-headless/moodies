@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/doomsday/agent/internal/claudeshim"
 	"github.com/doomsday/agent/internal/config"
 	"github.com/doomsday/agent/internal/filter"
 	"github.com/doomsday/agent/internal/proxy"
@@ -216,6 +218,13 @@ func main() {
 	// Watchdog
 	go watchdog(ctx, &mitmProc, cfg, outputPath, &applyCfg)
 
+	// Claude.app shim watchdog. Claude self-updates via Squirrel, which
+	// overwrites the whole .app bundle including Info.plist — wiping the
+	// HTTPS_PROXY + NODE_EXTRA_CA_CERTS entries we injected at install
+	// time. This loop re-applies them on every tick so capture survives
+	// invisible upgrades. No-op when Claude.app isn't installed at all.
+	go claudeShimLoop(ctx, cfg, home)
+
 	// PAC self-heal, tied to mitmdump health. PAC is only enabled while the
 	// proxy port is accepting connections — this avoids the phantom-proxy
 	// failure mode (PAC on, mitmdump dead → all traffic dies) during
@@ -347,6 +356,58 @@ func refreshManifestLoop(ctx context.Context, syncer *syncclient.Client, cfg *co
 			if err := m.SaveCache(); err != nil {
 				log.Printf("[refresh] cache write: %v", err)
 			}
+		}
+	}
+}
+
+// claudeShimLoop keeps Claude.app's LSEnvironment in sync with the daemon's
+// proxy config. Polled rather than file-watched because Squirrel (Electron's
+// auto-updater) does atomic .app bundle replacements that fs watchers
+// observe inconsistently across macOS versions — a 60s poll is cheap
+// (single PlistBuddy read), wakes the user up at most one minute of
+// uncaptured Claude traffic after an upgrade, and has no failure modes
+// the watcher path doesn't.
+func claudeShimLoop(ctx context.Context, cfg *config.Config, home string) {
+	shimCfg := claudeshim.Config{
+		ProxyURL: fmt.Sprintf("http://127.0.0.1:%d", cfg.ListenPort),
+		CAPath:   filepath.Join(home, ".mitmproxy", "mitmproxy-ca-cert.pem"),
+	}
+	// Once we hit ErrSIPProtected we know the kernel will refuse forever
+	// (until SIP is disabled, which won't happen at runtime). Stop the
+	// loop to keep daemon logs quiet rather than spam an unfixable error
+	// every minute.
+	sipBlocked := false
+	tick := func() {
+		if sipBlocked {
+			return
+		}
+		if !claudeshim.AppInstalled(shimCfg) {
+			return
+		}
+		if claudeshim.IsApplied(shimCfg) {
+			return
+		}
+		_, err := claudeshim.Apply(shimCfg)
+		switch {
+		case err == nil:
+			log.Printf("[claude-shim] re-injected LSEnvironment into Claude.app (post-upgrade or first run)")
+		case errors.Is(err, claudeshim.ErrSIPProtected):
+			log.Printf("[claude-shim] Claude.app is SIP-protected; desktop-app capture disabled (browser + CLI still work)")
+			sipBlocked = true
+		default:
+			log.Printf("[claude-shim] re-apply failed: %v", err)
+		}
+	}
+	tick()
+
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			tick()
 		}
 	}
 }
