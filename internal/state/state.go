@@ -24,8 +24,15 @@ type ComponentStatus struct {
 	// ClaudeShimApplied tracks whether we injected HTTPS_PROXY +
 	// NODE_EXTRA_CA_CERTS into Claude.app's LSEnvironment. Uninstall
 	// removes the entries; the daemon watchdog re-applies after Claude
-	// auto-updates wipe them.
+	// auto-updates wipe them. Note: this is blocked by SIP on notarised
+	// Claude.app builds; LaunchdEnvSet is the working alternative.
 	ClaudeShimApplied bool `json:"claude_shim_applied"`
+
+	// LaunchdEnvSet tracks whether com.doomsday.proxyenv.plist was written to
+	// ~/Library/LaunchAgents and loaded. This plist runs `launchctl setenv` at
+	// every login so all GUI apps (Claude.app, etc.) inherit HTTPS_PROXY and
+	// NODE_EXTRA_CA_CERTS without touching the app bundle (no SIP issues).
+	LaunchdEnvSet bool `json:"launchd_env_set"`
 }
 
 type State struct {
@@ -91,6 +98,8 @@ func (s *State) MarkComponent(name string, val any) error {
 		s.Components.MenuBarInstalled = val.(bool)
 	case "claude_shim_applied":
 		s.Components.ClaudeShimApplied = val.(bool)
+	case "launchd_env_set":
+		s.Components.LaunchdEnvSet = val.(bool)
 	case "launchd_loaded":
 		s.Components.LaunchdLoaded = val.(bool)
 	case "sqlite_initialized":

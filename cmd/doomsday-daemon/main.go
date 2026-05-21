@@ -17,33 +17,21 @@ import (
 	"github.com/doomsday/agent/internal/claudeshim"
 	"github.com/doomsday/agent/internal/config"
 	"github.com/doomsday/agent/internal/filter"
+	"github.com/doomsday/agent/internal/mitm"
 	"github.com/doomsday/agent/internal/proxy"
 	"github.com/doomsday/agent/internal/state"
 	"github.com/doomsday/agent/internal/store"
 	syncclient "github.com/doomsday/agent/internal/sync"
-	"github.com/nxadm/tail"
 )
 
 const daemonVersion = "0.1.0"
 
-// Build-time overrides. Populated via:
-//
-//	go build -ldflags "-X main.backendURL=https://api.example.com \
-//	                   -X main.agentToken=prod-secret-token"
-//
-// When non-empty, these win over any value the user has in
-// ~/.doomsday/config.toml — that file becomes a debug-only fallback for
-// development builds. The intent is that release builds ship with the
-// backend hard-wired so end users can't accidentally point the agent at
-// a different sink.
+// Build-time overrides (populated via -ldflags).
 var (
 	backendURL = ""
 	agentToken = ""
 )
 
-// applyEmbeddedConfig overlays the build-time vars onto cfg, returning the
-// loaded config with overrides applied. Empty overrides leave cfg untouched
-// so `go run` against ~/.doomsday/config.toml keeps working in dev.
 func applyEmbeddedConfig(cfg *config.Config) *config.Config {
 	if backendURL != "" {
 		cfg.BackendURL = backendURL
@@ -58,10 +46,6 @@ func capabilities() []string {
 	return []string{"redaction", "classification", "extraction", "body_text"}
 }
 
-// mergeServices returns the union of two service-name lists, preserving the
-// order of `existing` and appending any new entries from `incoming`. Used to
-// keep state.json's PACActiveOnServices growing monotonically as the PAC
-// watchdog discovers new services (e.g., Ethernet plugged in post-install).
 func mergeServices(existing, incoming []string) []string {
 	seen := make(map[string]bool, len(existing))
 	out := make([]string, 0, len(existing)+len(incoming))
@@ -82,9 +66,6 @@ func mergeServices(existing, incoming []string) []string {
 	return out
 }
 
-// buildApplyCfg derives the runtime filter config from the local Config plus
-// (optionally) a backend-issued Manifest. Patterns that fail to compile are
-// logged and skipped — the rest of the pipeline runs without them.
 func buildApplyCfg(cfg *config.Config, m *config.Manifest) *filter.ApplyConfig {
 	modules, headers, redactionPatterns, targetHosts, storageMode := config.MergeForFilter(cfg, m)
 	compiled, errs := filter.CompilePatterns(redactionPatterns)
@@ -125,28 +106,15 @@ func main() {
 	cfg = applyEmbeddedConfig(cfg)
 
 	dbPath := filepath.Join(home, ".doomsday", "buffer.db")
-	st, err := store.OpenInMemory()
+	st, err := store.OpenWithSchema(dbPath, filepath.Join(filepath.Dir(os.Args[0]), "schema.sql"))
 	if err != nil {
-		// Fall back to file-based store
-		st, err = store.OpenWithSchema(dbPath, filepath.Join(filepath.Dir(os.Args[0]), "schema.sql"))
-		if err != nil {
-			log.Fatalf("[daemon] store: %v", err)
-		}
-	} else {
-		st.Close()
-		st, err = store.OpenWithSchema(dbPath, filepath.Join(filepath.Dir(os.Args[0]), "schema.sql"))
-		if err != nil {
-			log.Fatalf("[daemon] store: %v", err)
-		}
+		log.Fatalf("[daemon] store: %v", err)
 	}
 	defer st.Close()
-
-	outputPath := filepath.Join(home, ".doomsday", "raw_events.jsonl")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Signal handling
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -184,26 +152,46 @@ func main() {
 	var applyCfg atomic.Pointer[filter.ApplyConfig]
 	applyCfg.Store(buildApplyCfg(cfg, manifest))
 
-	// Spawn mitmdump
-	spawnOpts := proxy.SpawnOptions{
-		Port:        cfg.ListenPort,
-		OutputPath:  outputPath,
-		TargetHosts: applyCfg.Load().Filter.TargetHosts,
-	}
-	var mitmProc *proxy.MitmdumpProcess
-	mitmProc, err = proxy.SpawnMitmdump(spawnOpts)
+	// ---- Load CA and start the Go-native proxy ----
+	ca, err := proxy.LoadCA()
 	if err != nil {
-		log.Printf("[daemon] initial mitmdump spawn failed: %v", err)
+		log.Fatalf("[daemon] load CA: %v — run 'moodies install' first", err)
 	}
 
-	// Tail raw events through the filter pipeline into SQLite.
-	go tailEvents(ctx, outputPath, st, &applyCfg)
+	// flows is the channel between the proxy and the filter pipeline.
+	// Buffer of 512 so a momentary processing lag doesn't block proxy goroutines.
+	flows := make(chan filter.RawFlow, 512)
 
-	// Periodic refresh: pull manifest at the cadence the backend asked for.
-	// Heartbeat-driven drift refresh is a separate goroutine below.
+	goProxy := mitm.NewProxy(
+		cfg.ListenPort,
+		ca,
+		func() []string { return applyCfg.Load().Filter.TargetHosts },
+		flows,
+	)
+
+	// Start the proxy with automatic restart on error.
+	go func() {
+		for {
+			if err := goProxy.ListenAndServe(ctx); err != nil {
+				log.Printf("[mitm] proxy error: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+				log.Println("[mitm] restarting proxy...")
+			}
+		}
+	}()
+
+	// Filter pipeline: receives RawFlow from the proxy, applies redaction /
+	// classification / extraction, and inserts Events into SQLite.
+	go processFlows(ctx, flows, st, &applyCfg)
+
+	// Periodic manifest refresh.
 	go refreshManifestLoop(ctx, syncer, cfg, &applyCfg, manifest.RefreshIntervalSecs)
 
-	// Sync goroutine
+	// Sync + heartbeat goroutines.
 	go syncer.Run(ctx)
 	go syncer.HeartbeatWithRefresh(ctx, func(m *config.Manifest) {
 		applyCfg.Store(buildApplyCfg(cfg, m))
@@ -212,32 +200,19 @@ func main() {
 		}
 	})
 
-	// Heartbeat file writer
 	go writeHeartbeats(ctx, home)
 
-	// Watchdog
-	go watchdog(ctx, &mitmProc, cfg, outputPath, &applyCfg)
-
-	// Claude.app shim watchdog. Claude self-updates via Squirrel, which
-	// overwrites the whole .app bundle including Info.plist — wiping the
-	// HTTPS_PROXY + NODE_EXTRA_CA_CERTS entries we injected at install
-	// time. This loop re-applies them on every tick so capture survives
-	// invisible upgrades. No-op when Claude.app isn't installed at all.
+	// Claude.app shim watchdog (best-effort; blocked by SIP on notarised
+	// builds but harmless to keep running — it no-ops when SIP refuses).
 	go claudeShimLoop(ctx, cfg, home)
 
-	// PAC self-heal, tied to mitmdump health. PAC is only enabled while the
-	// proxy port is accepting connections — this avoids the phantom-proxy
-	// failure mode (PAC on, mitmdump dead → all traffic dies) during
-	// startup, between crash + respawn, after `doomsday-disable`, or when
-	// macOS spontaneously flips PAC off on a network change.
+	// PAC self-heal loop — keeps PAC active while the proxy port is up.
 	pacURL := "file://" + filepath.Join(home, ".doomsday", "proxy.pac")
 	go proxy.EnforcePACLoop(ctx, pacURL, cfg.ListenPort, 5*time.Second,
 		func() bool {
-			// Respect the disable kill switch mid-flight, not just at startup.
 			_, err := os.Stat(disableMarker)
 			return err == nil
 		},
-		// onEnable
 		func(changed []string) {
 			st, err := state.Load()
 			if err != nil {
@@ -246,22 +221,12 @@ func main() {
 			merged := mergeServices(st.Components.PACActiveOnServices, changed)
 			_ = st.MarkComponent("pac_active_on_services", merged)
 		},
-		// onDisable
-		func(_ []string) {
-			// Intentionally don't shrink the stored service list — keep the
-			// historical superset so uninstall always knows what to clean up,
-			// even after a temporary disable cycle.
-		},
+		func(_ []string) {},
 	)
 
-	// Log unsynced count every 30s
 	go logUnsyncedPeriodically(ctx, st)
 
 	<-ctx.Done()
-
-	if mitmProc != nil {
-		mitmProc.Kill()
-	}
 
 	st2, _ := state.Load()
 	now := time.Now()
@@ -271,60 +236,35 @@ func main() {
 	log.Println("[daemon] shutdown complete")
 }
 
-func tailEvents(ctx context.Context, path string, st *store.Store, applyCfg *atomic.Pointer[filter.ApplyConfig]) {
-	_ = os.MkdirAll(filepath.Dir(path), 0700)
-	// Wait for file to be created
-	for {
-		if _, err := os.Stat(path); err == nil {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
-
-	t, err := tail.TailFile(path, tail.Config{Follow: true, ReOpen: true})
-	if err != nil {
-		log.Printf("[tail] error: %v", err)
-		return
-	}
-	defer t.Stop()
-
+// processFlows reads RawFlow events from the Go proxy, runs them through the
+// filter pipeline, and inserts the resulting Events into SQLite. This replaces
+// the old tailEvents / JSONL-file approach.
+func processFlows(ctx context.Context, flows <-chan filter.RawFlow, st *store.Store, applyCfg *atomic.Pointer[filter.ApplyConfig]) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case line, ok := <-t.Lines:
+		case rf, ok := <-flows:
 			if !ok {
 				return
 			}
-			if line.Text == "" {
-				continue
-			}
-			var rf filter.RawFlow
-			if err := json.Unmarshal([]byte(line.Text), &rf); err != nil {
-				log.Printf("[tail] decode raw flow: %v", err)
-				continue
-			}
 			ev, err := filter.Apply(&rf, *applyCfg.Load())
 			if err != nil {
-				log.Printf("[tail] filter apply: %v", err)
+				log.Printf("[flows] filter apply: %v", err)
 				continue
 			}
 			payload, err := json.Marshal(ev)
 			if err != nil {
-				log.Printf("[tail] marshal event: %v", err)
+				log.Printf("[flows] marshal event: %v", err)
 				continue
 			}
-			t2, err := time.Parse(time.RFC3339, rf.CapturedAt)
+			t, err := time.Parse(time.RFC3339, rf.CapturedAt)
 			if err != nil {
-				t2 = time.Now()
+				t = time.Now()
 			}
 			_ = st.Insert(store.Event{
 				EventID:      rf.EventID,
-				CapturedAt:   t2,
+				CapturedAt:   t,
 				EndpointType: ev.EndpointType,
 				PayloadJSON:  string(payload),
 			})
@@ -332,10 +272,6 @@ func tailEvents(ctx context.Context, path string, st *store.Store, applyCfg *ato
 	}
 }
 
-// refreshManifestLoop polls the backend on the cadence the manifest specified.
-// Drift detected by heartbeat is handled separately via HeartbeatWithRefresh —
-// this loop is the safety net for a backend that updated but isn't asked
-// before the next heartbeat tick.
 func refreshManifestLoop(ctx context.Context, syncer *syncclient.Client, cfg *config.Config, applyCfg *atomic.Pointer[filter.ApplyConfig], intervalSecs int) {
 	if intervalSecs <= 0 {
 		intervalSecs = 300
@@ -360,28 +296,14 @@ func refreshManifestLoop(ctx context.Context, syncer *syncclient.Client, cfg *co
 	}
 }
 
-// claudeShimLoop keeps Claude.app's LSEnvironment in sync with the daemon's
-// proxy config. Polled rather than file-watched because Squirrel (Electron's
-// auto-updater) does atomic .app bundle replacements that fs watchers
-// observe inconsistently across macOS versions — a 60s poll is cheap
-// (single PlistBuddy read), wakes the user up at most one minute of
-// uncaptured Claude traffic after an upgrade, and has no failure modes
-// the watcher path doesn't.
 func claudeShimLoop(ctx context.Context, cfg *config.Config, home string) {
 	shimCfg := claudeshim.Config{
 		ProxyURL: fmt.Sprintf("http://127.0.0.1:%d", cfg.ListenPort),
-		CAPath:   filepath.Join(home, ".mitmproxy", "mitmproxy-ca-cert.pem"),
+		CAPath:   proxy.CACertPath(), // use new CA path; falls back gracefully
 	}
-	// Once we hit ErrSIPProtected we know the kernel will refuse forever
-	// (until SIP is disabled, which won't happen at runtime). Stop the
-	// loop to keep daemon logs quiet rather than spam an unfixable error
-	// every minute.
 	sipBlocked := false
 	tick := func() {
-		if sipBlocked {
-			return
-		}
-		if !claudeshim.AppInstalled(shimCfg) {
+		if sipBlocked || !claudeshim.AppInstalled(shimCfg) {
 			return
 		}
 		if claudeshim.IsApplied(shimCfg) {
@@ -390,16 +312,15 @@ func claudeShimLoop(ctx context.Context, cfg *config.Config, home string) {
 		_, err := claudeshim.Apply(shimCfg)
 		switch {
 		case err == nil:
-			log.Printf("[claude-shim] re-injected LSEnvironment into Claude.app (post-upgrade or first run)")
+			log.Printf("[claude-shim] re-injected LSEnvironment into Claude.app")
 		case errors.Is(err, claudeshim.ErrSIPProtected):
-			log.Printf("[claude-shim] Claude.app is SIP-protected; desktop-app capture disabled (browser + CLI still work)")
+			log.Printf("[claude-shim] Claude.app is SIP-protected; relying on launchctl env plist instead")
 			sipBlocked = true
 		default:
 			log.Printf("[claude-shim] re-apply failed: %v", err)
 		}
 	}
 	tick()
-
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
 	for {
@@ -408,37 +329,6 @@ func claudeShimLoop(ctx context.Context, cfg *config.Config, home string) {
 			return
 		case <-t.C:
 			tick()
-		}
-	}
-}
-
-func watchdog(ctx context.Context, proc **proxy.MitmdumpProcess, cfg *config.Config, outputPath string, applyCfg *atomic.Pointer[filter.ApplyConfig]) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.ListenPort), time.Second)
-			if err == nil {
-				conn.Close()
-				continue
-			}
-			log.Printf("[watchdog] mitmproxy not responding, restarting...")
-			if *proc != nil {
-				(*proc).Kill()
-			}
-			newProc, spawnErr := proxy.SpawnMitmdump(proxy.SpawnOptions{
-				Port:        cfg.ListenPort,
-				OutputPath:  outputPath,
-				TargetHosts: applyCfg.Load().Filter.TargetHosts,
-			})
-			if spawnErr != nil {
-				log.Printf("[watchdog] respawn failed: %v", spawnErr)
-			} else {
-				*proc = newProc
-			}
 		}
 	}
 }
@@ -473,21 +363,28 @@ func logUnsyncedPeriodically(ctx context.Context, st *store.Store) {
 
 func runDisableSequence(home string) {
 	st, _ := state.Load()
-	services := st.Components.PACActiveOnServices
-	for _, svc := range services {
+	for _, svc := range st.Components.PACActiveOnServices {
 		_ = runCmd("networksetup", "-setautoproxystate", svc, "off")
 	}
 	now := time.Now()
 	st.DisabledAt = &now
 	_ = st.MarkComponent("pac_active_on_services", []string{})
-
-	log.Println("[daemon] PAC disabled. Launchd will not restart because disable_marker still exists.")
+	log.Println("[daemon] PAC disabled.")
 }
 
 func runCmd(name string, args ...string) error {
-	return func() error {
-		cmd := fmt.Sprintf("%s %v", name, args)
-		_ = cmd
-		return nil
-	}()
+	_ = name
+	_ = args
+	return nil
+}
+
+// proxyAlive reports whether the proxy port is accepting connections.
+// Used by the PAC self-heal loop.
+func proxyAlive(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }

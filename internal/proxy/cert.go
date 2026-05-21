@@ -2,57 +2,39 @@ package proxy
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"time"
+
+	"github.com/doomsday/agent/internal/mitm"
 )
 
+// CABundlePath is the private-key+certificate PEM bundle written by GenerateCA.
+// It is read by the proxy at startup to load the signing CA.
+func CABundlePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".doomsday", "ca.pem")
+}
+
+// CACertPath is the certificate-only PEM written by GenerateCA.
+// This is the file that goes into the login keychain and NODE_EXTRA_CA_CERTS.
+func CACertPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".doomsday", "ca-cert.pem")
+}
+
+// MitmproxyCACertPath returns the legacy mitmproxy cert path. Kept for
+// backward-compatibility references in doctorCmd and uninstall.
 func MitmproxyCACertPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".mitmproxy", "mitmproxy-ca-cert.pem")
 }
 
-// GenerateCA runs mitmdump briefly so it creates its CA bundle under
-// ~/.mitmproxy/, then kills it. We can't just `cmd.Run()` because mitmdump
-// has no natural exit condition — without an input flow file or shutdown
-// signal it idles forever even with `--no-server`. The fix: start it,
-// poll for the CA file to appear (typically <500ms after first invocation),
-// kill it, and verify the file exists. 15s ceiling so a genuinely stuck
-// mitmdump still returns an error instead of hanging the installer.
+// GenerateCA creates the moodies CA in pure Go (no mitmproxy required).
+// Writes the key+cert bundle to CABundlePath and the cert-only PEM to
+// CACertPath. No-op if the bundle already exists (idempotent).
 func GenerateCA() error {
-	if _, err := os.Stat(MitmproxyCACertPath()); err == nil {
-		return nil
-	}
-	mitmdump, err := resolveMitmdump()
-	if err != nil {
-		return err
-	}
-
-	cmd := exec.Command(mitmdump, "--no-server", "-w", "/dev/null")
-	// Discard mitmdump's chatty startup logs so the install output stays
-	// readable; if we ever need to debug, swap to os.Stderr.
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start mitmdump for CA generation: %w", err)
-	}
-
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(MitmproxyCACertPath()); err == nil {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	_ = cmd.Process.Kill()
-	_, _ = cmd.Process.Wait()
-
-	if _, err := os.Stat(MitmproxyCACertPath()); err != nil {
-		return fmt.Errorf("CA cert not generated at %s (mitmdump never wrote it)", MitmproxyCACertPath())
-	}
-	return nil
+	return mitm.GenerateCA(CABundlePath(), CACertPath())
 }
 
 func loginKeychain() string {
@@ -64,20 +46,54 @@ func loginKeychain() string {
 	return filepath.Join(home, "Library", "Keychains", "login.keychain")
 }
 
-// InstallCA adds the mitmproxy CA cert as trusted in the user's login keychain.
-// No admin/osascript required — the login keychain is owned by the user.
+// InstallCA adds the moodies CA cert as trusted in the user's login keychain.
+// No admin / osascript required — the login keychain is owned by the user.
 func InstallCA() error {
 	cmd := exec.Command("security", "add-trusted-cert", "-d", "-r", "trustRoot",
-		"-k", loginKeychain(), MitmproxyCACertPath())
+		"-k", loginKeychain(), CACertPath())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
+// UninstallCA removes the moodies CA cert from the login keychain.
+// Also removes the legacy mitmproxy cert if present (migration cleanup).
 func UninstallCA() error {
-	cmd := exec.Command("security", "delete-certificate", "-c", "mitmproxy", loginKeychain())
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	_ = cmd.Run()
+	// New CA (moodies CA)
+	_ = exec.Command("security", "delete-certificate", "-c", "moodies CA", loginKeychain()).Run()
+	// Legacy CA (mitmproxy CA from old installs)
+	_ = exec.Command("security", "delete-certificate", "-c", "mitmproxy", loginKeychain()).Run()
 	return nil
+}
+
+// CAInstalled reports whether any moodies CA cert is present in the keychain.
+func CAInstalled() bool {
+	// Check for new CA name first
+	out, err := exec.Command("security", "find-certificate", "-c", "moodies CA").Output()
+	if err == nil && len(out) > 0 {
+		return true
+	}
+	// Fall back to legacy mitmproxy name (existing installs)
+	out, err = exec.Command("security", "find-certificate", "-c", "mitmproxy").Output()
+	return err == nil && len(out) > 0
+}
+
+// LoadCA returns the CA for use by the proxy, preferring the new path and
+// falling back to the legacy mitmproxy CA so existing installs keep working
+// without requiring a reinstall.
+func LoadCA() (*mitm.CA, error) {
+	newPath := CABundlePath()
+	if _, err := os.Stat(newPath); err == nil {
+		return mitm.LoadCA(newPath)
+	}
+	// Backward compat: use mitmproxy CA if the new one hasn't been generated yet.
+	legacy := filepath.Join(func() string { h, _ := os.UserHomeDir(); return h }(), ".mitmproxy", "mitmproxy-ca.pem")
+	if _, err := os.Stat(legacy); err == nil {
+		ca, err := mitm.LoadCA(legacy)
+		if err != nil {
+			return nil, fmt.Errorf("load legacy mitmproxy CA: %w", err)
+		}
+		return ca, nil
+	}
+	return nil, fmt.Errorf("no CA found at %s (run 'moodies install')", newPath)
 }

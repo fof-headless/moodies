@@ -67,7 +67,7 @@ if [[ -n "${MOODIES_BACKEND_URL:-}" ]]; then
     bold "Backend URL: $BACKEND_URL (from MOODIES_BACKEND_URL)"
 else
     bold "Which backend should the daemon ship events to?"
-    DEFAULT_URL="http://localhost:4000"
+    DEFAULT_URL="https://moodies-backshot-production.up.railway.app"
     echo "  (press Enter to use: $DEFAULT_URL)"
     printf "Backend URL: "
     # Read from the controlling terminal even when stdin is a pipe — lets

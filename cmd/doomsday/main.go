@@ -67,17 +67,14 @@ func installCmd() *cobra.Command {
 			home, _ := os.UserHomeDir()
 
 			if !st.Components.CACertTrusted {
-				alreadyTrusted := func() bool {
-					out, err := exec.Command("security", "find-certificate", "-c", "mitmproxy").Output()
-					return err == nil && len(out) > 0
-				}()
-				if alreadyTrusted {
+				if proxy.CAInstalled() {
 					fmt.Println("[install] CA cert already trusted, skipping...")
 				} else {
-					fmt.Println("[install] Generating and installing CA cert...")
+					fmt.Println("[install] Generating moodies CA (pure Go, no mitmproxy needed)...")
 					if err := proxy.GenerateCA(); err != nil {
 						return fmt.Errorf("generate CA: %w", err)
 					}
+					fmt.Println("[install] Trusting CA cert in login keychain...")
 					if err := proxy.InstallCA(); err != nil {
 						return fmt.Errorf("install CA: %w", err)
 					}
@@ -118,11 +115,6 @@ func installCmd() *cobra.Command {
 				_ = st.MarkComponent("sqlite_initialized", true)
 			}
 
-			// Note: the mitmproxy addon (formerly sanitizer.py) is now
-			// embedded into the daemon binary and written to ~/.doomsday/_tap.py
-			// at every spawn (see internal/proxy/mitmdump.go writeAddon).
-			// No separate file copy needed at install time.
-
 			if !st.Components.LaunchdLoaded {
 				fmt.Println("[install] Installing launchd service...")
 				if err := writeLaunchdPlist(home); err != nil {
@@ -135,34 +127,58 @@ func installCmd() *cobra.Command {
 				_ = st.MarkComponent("launchd_loaded", true)
 			}
 
-			// Claude.app capture: inject HTTPS_PROXY + NODE_EXTRA_CA_CERTS
-			// into Claude.app's LSEnvironment dict so every Dock-click
-			// launches the Electron app with our proxy env baked in. The
-			// alternative (system-wide launchctl setenv) has too broad a
-			// blast radius; the LSEnvironment edit is surgical. The daemon
-			// watchdog re-applies after Squirrel auto-updates wipe the
-			// keys, so users never have to think about it.
+			// Inject HTTPS_PROXY + NODE_EXTRA_CA_CERTS into the launchd GUI
+			// session so every app launched from the Dock (Claude.app, other
+			// Electron apps, native apps that respect the proxy env) routes AI
+			// traffic through moodies.
+			//
+			// Two mechanisms work together:
+			//   1. com.doomsday.proxyenv.plist  — runs `launchctl setenv` at
+			//      every login so the setting survives reboots.
+			//   2. Immediate `launchctl setenv` calls below — take effect in
+			//      the current session without requiring a logout/login cycle.
+			//
+			// This is the SIP-safe alternative to LSEnvironment injection:
+			// we don't touch the .app bundle at all.
+			if !st.Components.LaunchdEnvSet {
+				caPath := proxy.CACertPath()
+				fmt.Println("[install] Installing proxy env LaunchAgent (for Claude.app + all GUI apps)...")
+				if err := writeProxyEnvPlist(home, caPath); err != nil {
+					fmt.Printf("[install]   proxy env plist write failed: %v (continuing)\n", err)
+				} else {
+					envPlist := filepath.Join(home, "Library", "LaunchAgents", "com.doomsday.proxyenv.plist")
+					_ = exec.Command("launchctl", "load", envPlist).Run()
+					// Also set immediately in the current session.
+					proxyURL := "http://127.0.0.1:8080"
+					_ = exec.Command("launchctl", "setenv", "HTTPS_PROXY", proxyURL).Run()
+					_ = exec.Command("launchctl", "setenv", "HTTP_PROXY", proxyURL).Run()
+					_ = exec.Command("launchctl", "setenv", "NODE_EXTRA_CA_CERTS", caPath).Run()
+					_ = st.MarkComponent("launchd_env_set", true)
+					fmt.Println("[install]   HTTPS_PROXY injected into GUI session — Claude.app will be captured")
+				}
+			}
+
+			// Best-effort LSEnvironment shim (works when SIP is off or on
+			// non-notarised builds). The daemon watchdog keeps it current
+			// after Squirrel auto-updates. Silently skipped when SIP blocks.
 			if !st.Components.ClaudeShimApplied {
 				cfg, _ := config.Load()
 				shimCfg := claudeshim.Config{
 					ProxyURL: fmt.Sprintf("http://127.0.0.1:%d", cfg.ListenPort),
-					CAPath:   filepath.Join(home, ".mitmproxy", "mitmproxy-ca-cert.pem"),
+					CAPath:   proxy.CACertPath(),
 				}
 				if !claudeshim.AppInstalled(shimCfg) {
-					fmt.Println("[install]   Claude.app not found at /Applications — skipping Claude shim")
+					fmt.Println("[install]   Claude.app not found at /Applications — skipping LSEnvironment shim")
 				} else {
-					fmt.Println("[install] Injecting proxy env into Claude.app's Info.plist...")
+					fmt.Println("[install] Attempting LSEnvironment injection into Claude.app...")
 					switch _, err := claudeshim.Apply(shimCfg); {
 					case err == nil:
-						fmt.Println("[install]   Claude.app now captures by default on every launch")
+						fmt.Println("[install]   LSEnvironment shim applied (double-coverage with launchctl env)")
 						_ = st.MarkComponent("claude_shim_applied", true)
 					case errors.Is(err, claudeshim.ErrSIPProtected):
-						fmt.Println("[install]   Claude.app is SIP-protected by macOS — desktop-app capture")
-						fmt.Println("[install]   isn't possible without disabling System Integrity Protection.")
-						fmt.Println("[install]   Browser + claude CLI capture still works. To capture the")
-						fmt.Println("[install]   desktop app, see README for the LaunchAgent option.")
+						fmt.Println("[install]   Claude.app is SIP-notarised — LSEnvironment blocked (launchctl env covers this)")
 					default:
-						fmt.Printf("[install]   claude shim apply failed: %v (continuing)\n", err)
+						fmt.Printf("[install]   LSEnvironment shim failed: %v (launchctl env still active)\n", err)
 					}
 				}
 			}
@@ -188,36 +204,38 @@ func installCmd() *cobra.Command {
 				}
 			}
 
-			// Claude Code shim — captures the `claude` CLI without breaking
-			// other tools. The shim is a tiny binary that, when invoked,
-			// probes 127.0.0.1:8080, sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS
-			// scoped to that one process, and exec's the real `claude`.
-			// Falls back to direct exec if the proxy is down. We never
-			// touch a system-wide HTTPS_PROXY — the user's Python/Go/Node
-			// apps stay untouched and keep working when the daemon dies.
+			// Shell rc injection — two things in one managed block:
+			//   1. PATH prepend for the `claude` shim binary.
+			//   2. HTTPS_PROXY + NODE_EXTRA_CA_CERTS so terminal-launched tools
+			//      (Python scripts, Go programs, `openai` CLI, etc.) also route
+			//      through moodies when the proxy is running.
 			if len(st.Components.ShellRCFiles) == 0 || !shimInstalled(home) {
-				fmt.Println("[install] Installing claude shim...")
+				fmt.Println("[install] Installing claude shim + shell proxy env...")
 				if err := installClaudeShim(home); err != nil {
 					return fmt.Errorf("install shim: %w", err)
 				}
 				binDir := filepath.Join(home, ".moodies", "bin")
+				caPath := proxy.CACertPath()
 				targets := shellrc.DetectTargets()
 				var modified []string
 				for _, t := range targets {
-					lines := shellrc.PathPrependLines(t.Shell, binDir)
+					lines := append(
+						shellrc.PathPrependLines(t.Shell, binDir),
+						shellrc.ProxyEnvLines(t.Shell, caPath)...,
+					)
 					changed, err := shellrc.InstallBlock(t, lines)
 					if err != nil {
 						fmt.Printf("[install]   skip %s: %v\n", t.Path, err)
 						continue
 					}
 					if changed {
-						fmt.Printf("[install]   added PATH prepend to %s\n", t.Path)
+						fmt.Printf("[install]   updated %s (PATH + proxy env)\n", t.Path)
 					}
 					modified = append(modified, t.Path)
 				}
 				if len(modified) > 0 {
 					_ = st.MarkComponent("shell_rc_files", modified)
-					fmt.Println("[install] NOTE: open a new terminal for the `claude` shim to take effect.")
+					fmt.Println("[install] NOTE: open a new terminal for the proxy env to take effect.")
 				}
 			}
 
@@ -259,6 +277,15 @@ func uninstallCmd() *cobra.Command {
 			_ = exec.Command("launchctl", "unload", plistPath).Run()
 			_ = os.Remove(plistPath)
 			_ = st.MarkComponent("launchd_loaded", false)
+
+			// Remove the proxy env LaunchAgent and clear the session env vars.
+			envPlist := filepath.Join(home, "Library", "LaunchAgents", "com.doomsday.proxyenv.plist")
+			_ = exec.Command("launchctl", "unload", envPlist).Run()
+			_ = os.Remove(envPlist)
+			_ = exec.Command("launchctl", "unsetenv", "HTTPS_PROXY").Run()
+			_ = exec.Command("launchctl", "unsetenv", "HTTP_PROXY").Run()
+			_ = exec.Command("launchctl", "unsetenv", "NODE_EXTRA_CA_CERTS").Run()
+			_ = st.MarkComponent("launchd_env_set", false)
 
 			for _, svc := range st.Components.PACActiveOnServices {
 				_ = exec.Command("networksetup", "-setautoproxystate", svc, "off").Run()
@@ -383,13 +410,10 @@ func doctorCmd() *cobra.Command {
 
 			var checks []Check
 
-			// 1. CA cert
-			caOk := false
-			out, err := exec.Command("security", "find-certificate", "-c", "mitmproxy").Output()
-			if err == nil && len(out) > 0 {
-				caOk = true
-			}
-			checks = append(checks, Check{"CA cert in keychain", boolStatus(caOk), proxy.MitmproxyCACertPath(), false, "doomsday install"})
+			// 1. CA cert (check both new "moodies CA" and legacy "mitmproxy" name)
+			caOk := proxy.CAInstalled()
+			caDetail := proxy.CACertPath()
+			checks = append(checks, Check{"CA cert in keychain", boolStatus(caOk), caDetail, false, "doomsday install"})
 
 			// 2. PAC file
 			pacPath := filepath.Join(home, ".doomsday", "proxy.pac")
@@ -406,11 +430,11 @@ func doctorCmd() *cobra.Command {
 			launchOk := strings.Contains(string(launchOut), "com.doomsday")
 			checks = append(checks, Check{"launchd loaded", boolStatus(launchOk), "", false, "doomsday start"})
 
-			// 5. mitmdump port listening
+			// 5. Go proxy port listening
 			conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:8080", time.Second)
 			mitmOk := dialErr == nil
 			if mitmOk { conn.Close() }
-			checks = append(checks, Check{"mitmdump port 8080", boolStatus(mitmOk), "", true, "launchctl kickstart -k gui/" + uidStr() + "/com.doomsday.agent"})
+			checks = append(checks, Check{"proxy port 8080", boolStatus(mitmOk), "", true, "launchctl kickstart -k gui/" + uidStr() + "/com.doomsday.agent"})
 
 			// 6. SQLite writable
 			dbPath := filepath.Join(home, ".doomsday", "buffer.db")
@@ -431,6 +455,11 @@ func doctorCmd() *cobra.Command {
 			if pacActive && !mitmOk {
 				checks = append(checks, Check{"Phantom proxy", "fail", "PAC active but port 8080 not listening — proxy traffic will fail", true, "doomsday doctor --fix"})
 			}
+
+			// 9b. launchctl env (HTTPS_PROXY set for GUI apps)
+			envOut, _ := exec.Command("launchctl", "getenv", "HTTPS_PROXY").Output()
+			envOk := strings.Contains(strings.TrimSpace(string(envOut)), "127.0.0.1")
+			checks = append(checks, Check{"launchctl HTTPS_PROXY", boolStatus(envOk), "needed for Claude.app capture", false, "doomsday install"})
 
 			// 9. Claude shim installed + PATH wired.
 			shimPath := filepath.Join(home, ".moodies", "bin", "claude")
@@ -610,6 +639,48 @@ func writeLaunchdPlist(home string) error {
 	plistDir := filepath.Join(home, "Library", "LaunchAgents")
 	if err := os.MkdirAll(plistDir, 0755); err != nil { return err }
 	return os.WriteFile(filepath.Join(plistDir, "com.doomsday.agent.plist"), []byte(plist), 0644)
+}
+
+// writeProxyEnvPlist creates ~/Library/LaunchAgents/com.doomsday.proxyenv.plist.
+// This plist runs `launchctl setenv` at every login, injecting HTTPS_PROXY and
+// NODE_EXTRA_CA_CERTS into the launchd GUI bootstrap session so all subsequently
+// launched applications (Claude.app, Cursor, VSCode, etc.) see the proxy env
+// without needing any modification to their app bundles.
+//
+// Why launchctl setenv instead of LSEnvironment injection:
+//   - LSEnvironment requires writing to the .app bundle's Info.plist which
+//     is blocked by macOS System Integrity Protection on notarised apps
+//     (including Claude.app from Anthropic).
+//   - launchctl setenv operates on the launchd session — no app bundle
+//     touches, no SIP issues, survives Squirrel auto-updates.
+func writeProxyEnvPlist(home, caPath string) error {
+	proxyURL := "http://127.0.0.1:8080"
+	script := fmt.Sprintf(
+		"launchctl setenv HTTPS_PROXY %s; launchctl setenv HTTP_PROXY %s; launchctl setenv NODE_EXTRA_CA_CERTS %s",
+		proxyURL, proxyURL, caPath,
+	)
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.doomsday.proxyenv</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>%s</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>`, script)
+
+	plistDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(plistDir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(plistDir, "com.doomsday.proxyenv.plist"), []byte(plist), 0644)
 }
 
 // findMenuBarApp locates a built MoodiesMenuBar.app bundle. Search order:

@@ -1,5 +1,5 @@
 class Moodies < Formula
-  desc "Local proxy agent that captures and sanitizes Claude.ai traffic"
+  desc "Local proxy agent that captures AI API traffic (Claude, OpenAI, Gemini, and more)"
   homepage "https://github.com/fof-headless/moodies"
   url "https://github.com/fof-headless/moodies/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "579a0f61f5cea24a09ad90556c2636f01cd4378774e1a628244a4a07d5fef15c"
@@ -7,7 +7,7 @@ class Moodies < Formula
   head "https://github.com/fof-headless/moodies.git", branch: "main"
 
   depends_on "go" => :build
-  depends_on "mitmproxy"
+  # mitmproxy is no longer needed — the proxy is now a pure-Go embedded binary.
 
   def install
     ldflags = %W[

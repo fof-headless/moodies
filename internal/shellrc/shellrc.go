@@ -4,11 +4,6 @@
 // cleanly on uninstall without disturbing the user's own lines. The block
 // content is supplied by the caller — this package only knows about
 // markers, atomic writes, and shell-syntax differences.
-//
-// Caution: never put `HTTPS_PROXY` / `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`
-// into the block. Setting those system-wide breaks every CLI tool when the
-// proxy is down and forces the wrong CA on every TLS handshake. The current
-// install only adds a $PATH prepend so the `claude` shim wins lookups.
 package shellrc
 
 import (
@@ -83,6 +78,25 @@ func PathPrependLines(shell, dir string) []string {
 		return []string{fmt.Sprintf("set -gx PATH %s $PATH", dir)}
 	}
 	return []string{fmt.Sprintf("export PATH=%q:$PATH", dir)}
+}
+
+// ProxyEnvLines renders the shell-specific lines that set HTTPS_PROXY,
+// HTTP_PROXY, and NODE_EXTRA_CA_CERTS so terminal-launched tools (Python
+// scripts, Go programs, openai/gemini CLIs, etc.) route through moodies.
+// caPath is the path to the moodies CA certificate PEM file.
+func ProxyEnvLines(shell, caPath string) []string {
+	if shell == "fish" {
+		return []string{
+			"set -gx HTTPS_PROXY http://127.0.0.1:8080",
+			"set -gx HTTP_PROXY http://127.0.0.1:8080",
+			fmt.Sprintf("set -gx NODE_EXTRA_CA_CERTS %s", caPath),
+		}
+	}
+	return []string{
+		"export HTTPS_PROXY=http://127.0.0.1:8080",
+		"export HTTP_PROXY=http://127.0.0.1:8080",
+		fmt.Sprintf("export NODE_EXTRA_CA_CERTS=%q", caPath),
+	}
 }
 
 // renderBlock wraps the supplied lines in begin/end markers, with a trailing

@@ -51,7 +51,7 @@ func DefaultPath() string {
 // Anything in config.toml overrides these on a per-field basis.
 func Defaults() *Config {
 	return &Config{
-		BackendURL:  "http://localhost:4000",
+		BackendURL:  "https://moodies-backshot-production.up.railway.app",
 		AgentToken:  "changeme-set-in-env",
 		StorageMode: "raw",
 		ListenPort:  8080,
